@@ -1,0 +1,488 @@
+---
+title: "BIOSTAT 707 Checkpoint 1: Cohort Characterization and EDA"
+author: "YAOYANG LI (yl1210)"
+date: now
+format:
+  html:
+    embed-resources: true
+    toc: true
+    code-fold: true
+    df-print: paged
+engine: knitr
+execute:
+  echo: true
+  warning: false
+  error: false
+---
+
+```{r}
+#| label: setup
+#| message: false
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dplyr)
+  library(tidyr)
+  library(readr)
+  library(ggplot2)
+  library(gtsummary)
+})
+
+here::i_am("checkpoint1.qmd")
+data_dir <- here::here("data")
+set_a_dir <- here::here("data", "set-a")
+out_dir <- here::here("output")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+expected_n <- 4000L
+
+theme_set(theme_minimal(base_size = 12))
+options(dplyr.summarise.inform = FALSE, scipen = 999)
+```
+
+## Reproducibility and data checks
+
+The analysis uses the 4,000 labeled ICU stays in [PhysioNet Challenge 2012 set A](https://physionet.org/content/challenge-2012/1.0.0/). The raw records contain six admission descriptors and repeated measurements from the first 48 hours of the ICU stay. PhysioNet specifies that `-1` means missing or unknown, so it is never treated as a physiologic value. The dataset citation is Silva I, Moody G, Scott DJ, Celi LA, and Mark RG (2012), “Predicting in-hospital mortality of ICU patients: The PhysioNet/Computing in Cardiology Challenge 2012,” *Computing in Cardiology* 39:245–248.
+
+```{r}
+#| label: check-data
+record_files <- sort(list.files(set_a_dir, pattern = "^[0-9]+\\.txt$", full.names = TRUE))
+outcome_path <- file.path(data_dir, "Outcomes-a.txt")
+
+stopifnot(
+  "data/set-a/ is missing" = dir.exists(set_a_dir),
+  "data/Outcomes-a.txt is missing" = file.exists(outcome_path),
+  "Expected exactly 4,000 set-A record files" = length(record_files) == expected_n
+)
+
+outcomes <- fread(outcome_path, na.strings = "-1") |>
+  as_tibble() |>
+  rename(
+    record_id = RecordID,
+    saps_i = `SAPS-I`,
+    sofa = SOFA,
+    length_of_stay = Length_of_stay,
+    survival_days = Survival,
+    in_hospital_death = `In-hospital_death`
+  )
+
+file_ids <- as.integer(sub("\\.txt$", "", basename(record_files)))
+stopifnot(
+  "Expected exactly 4,000 outcome rows" = nrow(outcomes) == expected_n,
+  "Record files and outcome IDs do not match" = setequal(file_ids, outcomes$record_id),
+  "Outcome must be coded 0/1" = all(outcomes$in_hospital_death %in% c(0, 1))
+)
+```
+
+## Construct the long table
+
+Each file is read with its filename-derived record identifier. Time is retained both as the original `HH:MM` string and as elapsed hours. `raw_value` is unchanged from the source. `value` converts the `-1` sentinel and values outside deliberately broad physical/clinical plausibility bounds to `NA`. These bounds are data-quality screens, not normal laboratory reference ranges: their purpose is to catch impossible values and obvious unit or entry problems without trimming merely severe illness.
+
+```{r}
+#| label: load-and-clean
+read_record <- function(path) {
+  x <- fread(path, colClasses = c(Time = "character", Parameter = "character", Value = "numeric"))
+  stopifnot(identical(names(x), c("Time", "Parameter", "Value")))
+  pieces <- tstrsplit(x$Time, ":", fixed = TRUE)
+  data.table(
+    record_id = as.integer(sub("\\.txt$", "", basename(path))),
+    source_row = seq_len(nrow(x)),
+    time = x$Time,
+    time_hours = as.numeric(pieces[[1]]) + as.numeric(pieces[[2]]) / 60,
+    parameter = x$Parameter,
+    raw_value = x$Value
+  )
+}
+
+long <- rbindlist(lapply(record_files, read_record), use.names = TRUE) |>
+  as_tibble()
+
+descriptor_vars <- c("RecordID", "Age", "Gender", "Height", "ICUType", "Weight")
+
+plausibility <- tribble(
+  ~parameter,     ~lower, ~upper,
+  "Age",              15,    120,
+  "Gender",            0,      1,
+  "Height",          100,    250,
+  "ICUType",           1,      4,
+  "Weight",           20,    500,
+  "Albumin",         0.5,      8,
+  "ALP",               5,   3000,
+  "ALT",               1,  10000,
+  "AST",               1,  20000,
+  "Bilirubin",       0.1,    100,
+  "BUN",               1,    300,
+  "Cholesterol",      20,   1000,
+  "Creatinine",      0.1,     30,
+  "DiasABP",          10,    180,
+  "FiO2",           0.20,      1,
+  "GCS",               3,     15,
+  "Glucose",          10,   1500,
+  "HCO3",              2,     60,
+  "HCT",               5,     75,
+  "HR",               10,    300,
+  "K",                 1,     12,
+  "Lactate",         0.1,     30,
+  "Mg",              0.2,     10,
+  "MAP",              10,    250,
+  "MechVent",          0,      1,
+  "Na",               80,    200,
+  "NIDiasABP",        10,    180,
+  "NIMAP",            10,    250,
+  "NISysABP",         20,    300,
+  "PaCO2",             5,    250,
+  "PaO2",             10,    700,
+  "pH",              6.5,      8,
+  "Platelets",         1,   2000,
+  "RespRate",          1,    100,
+  "SaO2",             20,    100,
+  "SysABP",           20,    300,
+  "Temp",             25,     45,
+  "TropI",             0,    100,
+  "TropT",             0,     50,
+  "Urine",             0,   5000,
+  "WBC",             0.1,    200
+)
+
+long <- long |>
+  left_join(plausibility, by = "parameter") |>
+  mutate(
+    is_descriptor = source_row <= 6 & parameter %in% descriptor_vars,
+    quality_flag = case_when(
+      raw_value == -1 ~ "missing_sentinel",
+      !is.na(lower) & (raw_value < lower | raw_value > upper) ~ "outside_plausibility_bound",
+      TRUE ~ "as_recorded"
+    ),
+    value = if_else(quality_flag == "as_recorded", raw_value, NA_real_)
+  ) |>
+  select(record_id, source_row, time, time_hours, parameter,
+         raw_value, value, quality_flag, is_descriptor)
+
+stopifnot(
+  "Unexpected elapsed time" = all(long$time_hours >= 0 & long$time_hours <= 48),
+  "Some files contain a mismatched RecordID row" = long |>
+    filter(parameter == "RecordID") |>
+    summarise(ok = all(record_id == raw_value)) |>
+    pull(ok)
+)
+
+write_csv(long, file.path(out_dir, "set-a_long.csv"), na = "")
+```
+
+The resulting long table has `r scales::comma(nrow(long))` rows from `r n_distinct(long$record_id)` admissions and `r n_distinct(long$parameter)` named fields (including `RecordID`). It explicitly distinguishes `r scales::comma(sum(long$quality_flag == "missing_sentinel"))` source sentinel values from `r scales::comma(sum(long$quality_flag == "outside_plausibility_bound"))` values flagged by the plausibility screen.
+
+```{r}
+#| label: suspect-values
+suspect_summary <- long |>
+  filter(quality_flag == "outside_plausibility_bound") |>
+  group_by(parameter) |>
+  summarise(
+    flagged_n = n(),
+    records_n = n_distinct(record_id),
+    observed_min = min(raw_value),
+    observed_max = max(raw_value),
+    examples = paste(head(sort(unique(raw_value)), 5), collapse = ", "),
+    .groups = "drop"
+  ) |>
+  arrange(desc(flagged_n))
+
+if (nrow(suspect_summary) == 0) {
+  cat("No values fell outside the pre-specified plausibility bounds.")
+} else {
+  knitr::kable(
+    suspect_summary,
+    digits = 2,
+    caption = "Values excluded from summaries by the pre-specified plausibility screen"
+  )
+}
+```
+
+The original values remain auditable in `raw_value`; only `value` is used in summaries. This is preferable to winsorizing because replacing an impossible value with a boundary would invent a measurement. The main uncertainty is that some flags may reflect alternate units or misplaced decimal points rather than random error—for example, a height of 1.8 may be meters recorded in a centimeter field, and a pH of 735 may have lost its decimal point. Unit conversion would require a defensible, variable-specific rule; for this checkpoint I conservatively set such observations to missing and expose the decision.
+
+## Construct the wide table
+
+The wide table has one row per ICU stay. Admission descriptors and outcomes are joined to 48-hour time-series summaries. For every repeated variable I calculate count, first, last, minimum, maximum, and mean over the full 48 hours. I also include counts in hours 0–24 and 24–48 and an `ever` indicator. I do not impute: absent measurements remain explicit `NA`, while counts are zero. This avoids pretending an unmeasured clinical value was observed and keeps missingness available as a potential predictor for later checkpoints.
+
+```{r}
+#| label: build-wide
+static <- long |>
+  filter(is_descriptor, parameter != "RecordID") |>
+  group_by(record_id, parameter) |>
+  summarise(value = dplyr::first(value), .groups = "drop") |>
+  pivot_wider(names_from = parameter, values_from = value) |>
+  rename(age = Age, gender = Gender, height = Height, icu_type = ICUType, admission_weight = Weight)
+
+ts_vars <- sort(setdiff(unique(long$parameter), c("RecordID", "Age", "Gender", "Height", "ICUType")))
+all_record_variable <- tidyr::expand_grid(record_id = sort(file_ids), parameter = ts_vars)
+
+ts_summary <- long |>
+  filter(parameter %in% ts_vars, !is_descriptor, !is.na(value)) |>
+  arrange(record_id, parameter, time_hours, source_row) |>
+  group_by(record_id, parameter) |>
+  summarise(
+    n = n(),
+    first = dplyr::first(value),
+    last = dplyr::last(value),
+    min = min(value),
+    max = max(value),
+    mean = mean(value),
+    n_h00_24 = sum(time_hours < 24),
+    n_h24_48 = sum(time_hours >= 24),
+    .groups = "drop"
+  ) |>
+  right_join(all_record_variable, by = c("record_id", "parameter")) |>
+  mutate(
+    across(c(n, n_h00_24, n_h24_48), ~ replace_na(.x, 0)),
+    ever = as.integer(n > 0)
+  )
+
+wide_features <- ts_summary |>
+  pivot_wider(
+    names_from = parameter,
+    values_from = c(n, first, last, min, max, mean, n_h00_24, n_h24_48, ever),
+    names_glue = "{parameter}_{.value}"
+  )
+
+wide <- static |>
+  full_join(wide_features, by = "record_id") |>
+  left_join(outcomes, by = "record_id") |>
+  arrange(record_id)
+
+stopifnot(
+  "Wide table must have one row per admission" = nrow(wide) == expected_n,
+  "Wide table record IDs must be unique" = n_distinct(wide$record_id) == expected_n
+)
+
+write_csv(wide, file.path(out_dir, "set-a_wide.csv"), na = "")
+```
+
+## What exists at prediction time
+
+At the end of the 48-hour observation window, all admission descriptors and measurements represented in `set-a_wide.csv` could be available to a prospective model. The outcomes do not exist at prediction time: in-hospital death, length of stay, survival days, SAPS-I, and SOFA are joined only to describe the cohort and evaluate later models. They must not be used as predictors. In particular, length of stay and survival are post-baseline information, while SAPS-I and SOFA are outcome-file fields supplied for assessment rather than measurements from the raw record files.
+
+This checkpoint is descriptive, so I use all 4,000 records and their labels. In a modeling checkpoint, train/validation splitting must precede learned preprocessing and imputation. Missingness patterns and any thresholds chosen from the data would need to be learned inside resampling folds to avoid leakage.
+
+## Table 1
+
+Table 1 summarizes admission characteristics by in-hospital outcome. Continuous variables are shown as median (first quartile, third quartile) because the distributions are not assumed symmetric. Missing admission height or weight is reported rather than imputed. `Age`, `Gender`, `ICUType`, `Height`, and admission `Weight` are available at time zero; the outcome labels are used only for stratification.
+
+```{r}
+#| label: table1
+table1_data <- static |>
+  left_join(outcomes |> select(record_id, in_hospital_death), by = "record_id") |>
+  mutate(
+    in_hospital_death = factor(in_hospital_death, levels = c(0, 1), labels = c("Survived", "Died")),
+    gender = factor(gender, levels = c(0, 1), labels = c("Female", "Male")),
+    icu_type = factor(
+      icu_type,
+      levels = 1:4,
+      labels = c("Coronary care", "Cardiac surgery recovery", "Medical ICU", "Surgical ICU")
+    )
+  )
+
+table1_data |>
+  select(in_hospital_death, age, gender, height, admission_weight, icu_type) |>
+  tbl_summary(
+    by = in_hospital_death,
+    statistic = list(all_continuous() ~ "{median} ({p25}, {p75})"),
+    digits = all_continuous() ~ 1,
+    missing = "ifany",
+    label = list(
+      age ~ "Age (years)",
+      gender ~ "Gender",
+      height ~ "Height (cm)",
+      admission_weight ~ "Admission weight (kg)",
+      icu_type ~ "ICU type"
+    )
+  ) |>
+  add_overall(last = TRUE) |>
+  bold_labels()
+```
+
+## Outcome summary
+
+There were `r sum(outcomes$in_hospital_death == 1)` in-hospital deaths among `r nrow(outcomes)` admissions, an observed mortality of `r scales::percent(mean(outcomes$in_hospital_death), accuracy = 0.1)`. Outcomes coded `-1` in the source (for example, survival days among many survivors) were read as missing as specified by PhysioNet.
+
+```{r}
+#| label: outcome-summary
+outcome_summary <- outcomes |>
+  summarise(
+    `Admissions` = n(),
+    `In-hospital deaths` = sum(in_hospital_death),
+    `Mortality, %` = 100 * mean(in_hospital_death),
+    `Length of stay, median (IQR), days` = sprintf(
+      "%.0f (%.0f–%.0f)",
+      median(length_of_stay, na.rm = TRUE),
+      quantile(length_of_stay, 0.25, na.rm = TRUE),
+      quantile(length_of_stay, 0.75, na.rm = TRUE)
+    ),
+    `SAPS-I, median (IQR)` = sprintf(
+      "%.0f (%.0f–%.0f)",
+      median(saps_i, na.rm = TRUE),
+      quantile(saps_i, 0.25, na.rm = TRUE),
+      quantile(saps_i, 0.75, na.rm = TRUE)
+    ),
+    `SOFA, median (IQR)` = sprintf(
+      "%.0f (%.0f–%.0f)",
+      median(sofa, na.rm = TRUE),
+      quantile(sofa, 0.25, na.rm = TRUE),
+      quantile(sofa, 0.75, na.rm = TRUE)
+    )
+  )
+
+knitr::kable(outcome_summary, digits = 1, caption = "Outcome and severity summary")
+
+outcomes |>
+  mutate(outcome = if_else(in_hospital_death == 1, "Died", "Survived")) |>
+  count(outcome) |>
+  mutate(percent = n / sum(n)) |>
+  ggplot(aes(x = outcome, y = n, fill = outcome)) +
+  geom_col(width = 0.65, show.legend = FALSE) +
+  geom_text(aes(label = paste0(n, " (", scales::percent(percent, accuracy = 0.1), ")")), vjust = -0.4) +
+  scale_fill_manual(values = c("Died" = "#B2182B", "Survived" = "#4D7EA8")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  labs(x = NULL, y = "Admissions", title = "In-hospital outcome in set A")
+```
+
+## Temporal missingness map
+
+The heatmap below treats a variable as observed for a patient within a six-hour interval if at least one cleaned value is present. The cell color is the percentage of patients with any such measurement. This definition separates measurement presence from measurement frequency: a patient with ten heart-rate readings and a patient with one each contribute one observed patient to that interval.
+
+```{r}
+#| label: temporal-missingness
+#| fig-width: 10
+#| fig-height: 9
+bin_breaks <- seq(0, 48, by = 6)
+bin_labels <- paste0(sprintf("%02d", head(bin_breaks, -1)), "–", sprintf("%02d", tail(bin_breaks, -1)), "h")
+
+observed_by_bin <- long |>
+  filter(parameter %in% ts_vars, !is_descriptor, !is.na(value)) |>
+  mutate(
+    time_bin = cut(
+      time_hours,
+      breaks = c(bin_breaks[1:8], 48.0001),
+      labels = bin_labels,
+      include.lowest = TRUE,
+      right = FALSE
+    )
+  ) |>
+  distinct(record_id, parameter, time_bin) |>
+  count(parameter, time_bin, name = "patients_observed") |>
+  complete(parameter = ts_vars, time_bin = factor(bin_labels, levels = bin_labels),
+           fill = list(patients_observed = 0)) |>
+  mutate(percent_observed = 100 * patients_observed / expected_n)
+
+parameter_order <- observed_by_bin |>
+  group_by(parameter) |>
+  summarise(mean_observed = mean(percent_observed), .groups = "drop") |>
+  arrange(mean_observed) |>
+  pull(parameter)
+
+observed_by_bin |>
+  mutate(parameter = factor(parameter, levels = parameter_order)) |>
+  ggplot(aes(x = time_bin, y = parameter, fill = percent_observed)) +
+  geom_tile(color = "white", linewidth = 0.15) +
+  scale_fill_viridis_c(
+    option = "C",
+    limits = c(0, 100),
+    name = "Patients with ≥1\nmeasurement (%)"
+  ) +
+  labs(
+    x = "Hours since ICU admission",
+    y = NULL,
+    title = "Measurement availability changes across the first 48 hours",
+    subtitle = "Each cell is the percentage of 4,000 admissions observed at least once"
+  ) +
+  theme(panel.grid = element_blank(), axis.text.x = element_text(angle = 35, hjust = 1))
+```
+
+Common bedside variables are measured for many patients and repeatedly across the window, while specialized laboratory tests are sparse. Availability also changes over time, so a single 48-hour mean hides whether information arrived early enough to support an earlier prediction. Missingness is not necessarily random: clinicians order tests and adjust monitoring in response to severity, suspected diagnoses, treatment, and unit practice.
+
+## Missingness in the wide table
+
+The map below visualizes the `ever` columns in `set-a_wide.csv`. Each row is one admission, sorted by the number of time-series variables ever observed; each column is a variable. This shows the patient-level structure that a model would see after aggregation.
+
+```{r}
+#| label: wide-missingness-map
+#| fig-width: 11
+#| fig-height: 8
+wide_presence <- wide |>
+  select(record_id, ends_with("_ever")) |>
+  pivot_longer(-record_id, names_to = "parameter", values_to = "observed") |>
+  mutate(parameter = sub("_ever$", "", parameter))
+
+record_order <- wide_presence |>
+  group_by(record_id) |>
+  summarise(observed_variables = sum(observed), .groups = "drop") |>
+  arrange(observed_variables, record_id) |>
+  mutate(record_rank = row_number())
+
+wide_presence |>
+  left_join(record_order, by = "record_id") |>
+  mutate(parameter = factor(parameter, levels = parameter_order)) |>
+  ggplot(aes(x = record_rank, y = parameter, fill = factor(observed))) +
+  geom_raster() +
+  scale_fill_manual(
+    values = c("0" = "#F0F0F0", "1" = "#2166AC"),
+    labels = c("Missing", "Observed"),
+    name = NULL
+  ) +
+  labs(
+    x = "Admissions, ordered from fewest to most observed variables",
+    y = NULL,
+    title = "Patient-level missingness in the wide table"
+  ) +
+  theme(panel.grid = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+        legend.position = "top")
+```
+
+## Is measurement missingness associated with outcome?
+
+To explore whether measurement practice is informative, I compare mortality among patients ever versus never measured for each time-series variable. The table is descriptive and unadjusted. A large difference can reflect illness severity, an indication for a test, ICU type, or care workflow; it does not show that ordering the measurement changes mortality.
+
+```{r}
+#| label: missingness-and-outcome
+missingness_outcome <- wide_presence |>
+  left_join(outcomes |> select(record_id, in_hospital_death), by = "record_id") |>
+  group_by(parameter, observed) |>
+  summarise(n = n(), death_rate = mean(in_hospital_death), .groups = "drop") |>
+  mutate(group = if_else(observed == 1, "ever", "never")) |>
+  select(-observed) |>
+  pivot_wider(names_from = group, values_from = c(n, death_rate)) |>
+  mutate(
+    difference_pp = 100 * (death_rate_ever - death_rate_never),
+    abs_difference_pp = abs(difference_pp)
+  ) |>
+  arrange(desc(abs_difference_pp))
+
+missingness_outcome |>
+  slice_head(n = 15) |>
+  transmute(
+    Variable = parameter,
+    `Measured n` = n_ever,
+    `Measured mortality, %` = 100 * death_rate_ever,
+    `Unmeasured n` = n_never,
+    `Unmeasured mortality, %` = 100 * death_rate_never,
+    `Difference, percentage points` = difference_pp
+  ) |>
+  knitr::kable(digits = 1, caption = "Largest unadjusted mortality differences by measurement availability")
+```
+
+These associations support retaining explicit missingness indicators in later feature engineering. They should be validated within resampling, because measurement policy can differ across hospitals and time. Variables measured in almost everyone or almost no one also produce unstable or uninformative comparisons, so group sizes must be read alongside the percentage-point difference.
+
+## Eventual Challenge assessment criteria
+
+For the later binary prediction task, Challenge Event 1 scores a hard death prediction using the smaller of sensitivity, $TP/(TP+FN)$, and positive predictive value, $TP/(TP+FP)$. Maximizing the minimum discourages a model from gaining one by sacrificing the other; both missed deaths and excessive false alarms matter.
+
+For predicted risks, the modified Hosmer–Lemeshow statistic groups predictions into risk deciles and compares observed with expected deaths. Lower values indicate better calibration, with a small constant in the denominator to avoid division by zero. The Challenge's Event 2 score additionally divides this statistic by the spread between mean risk in the highest and lowest deciles, so useful risk separation is rewarded along with calibration. No model is fit or scored at Checkpoint 1.
+
+## AI-use statement
+
+I used OpenAI Codex substantially to help interpret the assignment and submission specification, draft and debug the R/Quarto workflow, propose broad data-quality checks, and create reproducible tables and figures. Benefits included faster setup, consistent file checks, and suggestions for visualizing temporal missingness. Risks included plausible-looking but incorrect clinical thresholds, silent data leakage, package-specific errors, and prose that could overstate what an observational pattern means.
+
+I reviewed the generated work by reading every code chunk, checking variable definitions against the PhysioNet documentation, preserving source values separately from cleaned values, asserting that all 4,000 records match the outcome file, asserting one row per admission in the wide table, and running the exact locked Pixi command used by the grader. I inspected the flagged-value table, both missingness maps, Table 1, and all written interpretations after rendering. I also verified that outcome-only fields are not described as predictors. I remain responsible for the submitted choices and interpretations.
+
+## Session information
+
+```{r}
+#| label: session-info
+sessioninfo::session_info()
+```
