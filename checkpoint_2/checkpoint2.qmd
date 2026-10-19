@@ -1,0 +1,232 @@
+---
+title: "BIOSTAT 707 — Checkpoint 2: mortality models on set-a"
+author: "YAOYANG LI (yl1210)"
+date: "2026-10-18"
+format:
+  html:
+    embed-resources: true
+    toc: true
+    code-fold: true
+    theme: cosmo
+execute:
+  echo: false
+  warning: false
+  message: false
+  error: false
+---
+
+## Artificial intelligence (AI) use statement
+
+OpenAI Codex assisted with adapting the Checkpoint 1 cleaning code, implementing nested cross-validation, preparing figures and tables, and drafting this report. Automated checks verify record identifiers, outcome coding, fold coverage, excluded predictors, complete held-out predictions, and agreement between saved-model and in-memory predictions. The analysis was executed against the actual set-a data. These are computational checks performed with AI assistance; they do not establish that the student has personally reviewed or understood every result. The advantages were faster implementation and explicit checks for leakage and reproducibility. The disadvantages are that generated code and clinical interpretations can be wrong, and a limited search may miss better configurations. **Before submission, the student must review the code and interpretations, make the judgments their own, and be able to explain them in an oral check.** This statement does not claim personal verification that has not occurred.
+
+```{r}
+#| label: run-analysis
+analysis_started <- Sys.time()
+source('scripts/build_features.R')
+source('scripts/modeling.R')
+theme_set(theme_minimal(base_size=12))
+fmt <- function(x) sprintf('%.3f',x)
+```
+
+## 2.1 The modeling table
+
+The outcome is `In-hospital_death` from `data/Outcomes-a.txt`, joined by `RecordID`. There is exactly one row per intensive care unit (ICU) stay, with all repeated measurements summarized over hours 0–48 inclusive. The code checks 4,000 unique identifiers, exact agreement with the outcome identifiers, binary outcomes, and the time window. The cohort contains **`r nrow(wide)` stays and `r sum(y)` deaths (`r sprintf('%.1f',100*mean(y))`%)**. Predictions describe in-hospital mortality using information available at the end of the supplied observation window; this is not an admission-time model.
+
+The same cleaning bounds and wide-table definitions as Checkpoint 1 are rebuilt directly from raw files, so this checkpoint does not require running Checkpoint 1 first. Sentinel `-1` values and measurements outside the original broad plausibility bounds become missing. Height zero and weight zero are excluded by the original lower bounds of 100 cm and 20 kg. No extra unit conversions or outcome-driven cutoffs are introduced. Implausible raw values remain auditable in the long table. These deliberately broad screens may still exclude real extremes or retain unit errors.
+
+```{r}
+#| label: cleaning-table
+quality_counts <- long |> count(quality_flag,name='Values')
+knitr::kable(quality_counts,caption='Table 1. Cleaning outcomes for source values, including descriptors.')
+```
+
+Table 1 distinguishes source missingness from the plausibility exclusions. Excluded values are set to missing rather than replaced by a physiologic boundary, which avoids inventing an observed measurement. The original data and cleaning rules are preserved for auditing.
+
+## 2.2 Predictors
+
+All predictors use hours 0–48 only. `RecordID`, `Length_of_stay`, `Survival`, and the outcome are excluded. The Simplified Acute Physiology Score I (SAPS-I) and Sequential Organ Failure Assessment (SOFA) scores are benchmarks only. Sex and ICU type use fixed, data-dictionary categories with an explicit unknown level. ICU type is represented by indicator columns rather than treated as a number from 1 to 4.
+
+```{r}
+#| label: predictor-groups
+predictor_groups <- data.frame(
+ Group=c('Admission descriptors','First and last','Minimum and maximum','Mean','Measurement counts','Ever measured'),
+ Number=c(5,2*length(ts_vars),2*length(ts_vars),length(ts_vars),3*length(ts_vars),length(ts_vars)),
+ Clinical_reason=c('Age, sex, height, ICU type, and admission weight describe baseline context.',
+ 'Starting level and most recent status describe initial and later physiology.',
+ 'Extremes describe physiologic instability and severity.',
+ 'Average level summarizes sustained organ dysfunction.',
+ 'Total and two 24-hour counts capture monitoring intensity and never-measured variables.',
+ 'Whether a variable was observed captures informative missingness.'))
+knitr::kable(predictor_groups,caption='Table 2. Predictor groups before categorical encoding and removal of constant columns.')
+```
+
+Table 2 contains **`r length(raw_predictors)` original predictor columns**. Counts and ever-measured indicators preserve the distinction between an unmeasured value and an observed normal value. Monitoring depends on severity, treatment, and practice patterns, so these predictors can aid prediction but are not causal effects. The feature set is intentionally redundant; ridge regularization can share information across correlated summaries. Weight has both an admission value and later repeated measurements, consistent with Checkpoint 1.
+
+No measurement variable is dropped for low observation frequency; there is no missingness-percentage threshold. Within each training split, numeric columns use training medians (zero only for an entirely missing column), and every encoded column is centered and scaled using training statistics. Constant columns, defined by standard deviation at most `1e-10`, are removed within that training split. These are the only automatic predictor exclusions. The full-data refit retains **`r ncol(full_x)` encoded predictors** and drops `r sum(!full_pp$keep)` constant encoded columns. The exact definitions, bounds, predictor names, and full-refit exclusions appear in the appendices.
+
+Numeric result tables are also saved in comma-separated values (CSV) format.
+
+Median imputation is simple and robust to skewed measurements. It does not propagate imputation uncertainty and may compress physiologic differences in heavily missing variables. Missingness predictors partly preserve information about observation, without supplying the missing physiology.
+
+## 2.3 Cross-validation design
+
+Five-fold cross-validation (CV) is stratified by death, with seed `7072026`. Each stay contributes exactly one row and one held-out prediction per model. The same outer folds evaluate all three models and both benchmarks. The saved fold file makes these assignments inspectable.
+
+For ridge and forest, three-fold stratified inner CV within each outer training set chooses hyperparameters by mean log loss. Every inner split fits its own medians, scaling statistics, and constant-column filter; the chosen configuration then fits preprocessing and the model on the complete outer training set. The outer held-out fold is never used for tuning. The generalized additive model (GAM) uses a prespecified clinical feature set; its smoothness is estimated by restricted maximum likelihood (REML) using training rows only. No early stopping or class rebalancing is used. The area under the receiver operating characteristic (ROC) curve (AUROC) measures discrimination and is reported for each outer fold, its mean, and its sample standard deviation (SD).
+
+```{r}
+#| label: folds-table
+fold_counts <- data.frame(Fold=1:5,Stays=as.integer(table(outer_fold)),Deaths=as.integer(tapply(y,outer_fold,sum)))
+knitr::kable(fold_counts,caption='Table 3. Held-out fold composition.')
+```
+
+Table 3 shows balanced fold sizes and closely matched death counts. Within-model tuning avoids optimism from using the outer fold to choose hyperparameters. However, selecting the final model family using these same five outer-fold scores introduces model-selection optimism; these folds are not a fully independent evaluation of the eventual winner. Set-b and set-c remain unread for Checkpoint 3.
+
+## 2.4 Model 1: ridge logistic regression
+
+Ridge (an L2 penalty) uses all eligible predictors. It is preferred here to variable selection because repeated summaries and missingness counts are correlated; shrinkage can stabilize their combined contribution without arbitrarily keeping only one. The fixed penalty grid is `10^seq(0, -4, length.out=9)`, namely nine values from 1 to 0.0001. Predictors are already scaled within training splits, so `glmnet` standardization is disabled. Coefficients from the full-set-a refit therefore share a one-standard-deviation scale, including encoded indicators. For a binary indicator, this scale is not the full 0-to-1 contrast.
+
+```{r}
+#| label: ridge-tuning
+ridge_tuning <- data.frame(Fit=c(paste('Outer',1:5),'Full set-a'),Lambda=c(sapply(tuning,`[[`,'lambda'),final_tuning$lambda))
+knitr::kable(ridge_tuning,digits=5,caption='Table 4. Ridge penalties chosen by training-only inner CV.')
+```
+
+Table 4 shows the preferred amount of shrinkage in each training set. Across the five outer training sets, selected penalties range from `r min(ridge_tuning$Lambda[1:5])` to `r max(ridge_tuning$Lambda[1:5])`; `r if(length(unique(ridge_tuning$Lambda[1:5]))==1) 'the same penalty is selected in every fold, suggesting stable shrinkage selection on this grid.' else 'the penalty choice varies across training samples, so the precise amount of shrinkage is less stable than the model family choice.'` Ridge retains all nonconstant encoded columns, so selection frequencies for the least absolute shrinkage and selection operator (LASSO) do not apply. Coefficient magnitude can be split across correlated summaries; a small individual coefficient does not show that the underlying measurement is unimportant.
+
+```{r}
+#| label: coefficient-plot
+#| fig-width: 9
+#| fig-height: 7
+#| fig-cap: "Figure 1. Largest 25 standardized coefficients of the full-set-a ridge refit."
+coef_plot
+```
+
+Figure 1 ranks the largest absolute coefficients. Positive coefficients correspond to higher fitted log odds conditional on the other predictors, and negative coefficients to lower fitted log odds. The five largest absolute coefficients are `r paste(head(coef_table$Predictor,5),collapse=', ')`. Their direction must be interpreted with the predictor definition, correlated summaries, missingness, and treatment effects in mind; these associations do not estimate effects of changing a patient's measurements.
+
+[Open the complete coefficient plot, including every retained predictor](cp2_all_coefficients.png). The complete numeric coefficient table is saved as `output/cp2_ridge_coefficients.csv`.
+
+## 2.5 Model 2: non-linear effects with a GAM
+
+The logistic GAM uses 15 original predictors chosen on clinical grounds before model comparison: age; minimum Glasgow Coma Scale (GCS); maximum blood urea nitrogen (BUN); last creatinine; maximum lactate; maximum heart rate (HR); minimum mean arterial pressure (MAP); last temperature; maximum white blood cell count (WBC); minimum platelets; maximum respiratory rate; mean urine measurement; lactate measurement count; sex; and ICU type. They cover baseline risk, neurologic status, renal function, tissue perfusion, hemodynamics, inflammation, hematology, respiratory state, and monitoring. Mean urine is a mean of recorded volumes, not a normalized hourly urine output.
+
+Twelve continuous predictors use cubic regression splines (`bs='cr'`, basis dimension `k=4`). Lactate count and categorical indicators enter linearly. REML chooses smoothing with shrinkage (`select=TRUE`) on training rows. The small basis limits flexibility given approximately 554 deaths. No screening on the complete cohort's outcomes chooses these variables.
+
+```{r}
+#| label: partial-effects
+#| fig-width: 10
+#| fig-height: 4.5
+#| fig-cap: "Figure 2. Centered GAM contributions to log odds, in original measurement units."
+partial_plot
+```
+
+Figure 2 shows smooth components relative to their centering constraint; zero is the average component contribution, not a zero risk. Bands are approximate pointwise 95% confidence intervals conditional on the fitted model and imputation, and the plotted domain is the central 95% of observed values. They are not simultaneous bands or evidence of a causal relationship.
+
+```{r}
+#| label: smooth-summary
+st <- as.data.frame(summary(full_gam)$s.table)
+st$Predictor <- rownames(st)
+knitr::kable(st[,c('Predictor','edf')],digits=2,caption='Table 5. Effective degrees of freedom (EDF) of the full-data GAM smooths.')
+```
+
+Table 5 quantifies fitted flexibility: EDF near one suggests an approximately linear retained component; substantially larger EDF allows curvature, while shrinkage toward zero indicates a weak fitted component. For the three plotted variables, the EDF are **GCS `r sprintf('%.2f',st['s(GCS_min)','edf'])`, lactate `r sprintf('%.2f',st['s(Lactate_max)','edf'])`, and MAP `r sprintf('%.2f',st['s(MAP_min)','edf'])`**.
+
+The GCS curve is approximately linear over the plotted range: higher minimum GCS has a lower fitted log-odds contribution. That direction is clinically plausible because lower scores can reflect impaired consciousness, although sedation can also lower GCS. The lactate curve is also approximately linear, with higher maximum lactate associated with higher fitted log odds; this is compatible with lactate marking impaired perfusion or severe illness. Neither curve supplies strong evidence of non-linearity after shrinkage in this model. The MAP component is nearly flat, heavily shrunk, and its confidence band includes zero throughout the plotted range. Thus this fit does not support a clear independent MAP association or non-linear shape after conditioning on the other variables; it does not show that blood pressure is clinically unimportant. These interpretations describe this fitted conditional association and require student review.
+
+## 2.6 Model 3: random forest
+
+The probability random forest uses 300 trees, maximum depth 12, and the same eligible encoded predictors as ridge. Four combinations tune the fraction of predictors tried at each split (`0.15` or `0.40`, rounded down to at least one predictor) and minimum node size (10 or 30). Three-fold inner CV selects by log loss. The fixed seed controls randomness; two computation threads limit resource use. All missing values are imputed within the training split using the same pipeline as ridge. No outer-fold stopping or tuning is performed.
+
+```{r}
+#| label: forest-tuning
+forest_tuning <- do.call(rbind,lapply(seq_along(tuning),function(i) data.frame(Fit=paste('Outer',i),tuning[[i]]$rf)))
+forest_tuning <- rbind(forest_tuning,data.frame(Fit='Full set-a',final_tuning$rf))
+knitr::kable(forest_tuning,caption='Table 6. Forest configurations chosen within training data.')
+```
+
+Table 6 records the selected forest settings. `r if(nrow(unique(forest_tuning[1:5,c('mtry_fraction','min_node_size')]))==1) 'The same configuration is selected in every outer training set, indicating stable tuning on this small grid.' else 'The chosen configuration varies across outer training sets, showing that the preferred forest complexity depends on the training sample.'` The compact search balances runtime against flexibility and is not an exhaustive search for maximum performance. A forest can capture interactions and thresholds that the additive GAM and linear ridge model cannot, but needs enough observations to estimate those patterns reliably.
+
+## 2.7 Comparison and final model
+
+```{r}
+#| label: comparison-table
+knitr::kable(comparison,digits=3,row.names=FALSE,caption='Table 7. AUROC on identical held-out folds; mean and sample SD across five folds.')
+```
+
+Table 7 directly compares all five scoring methods on the same patients. SAPS-I and SOFA enter as the raw supplied scores, with higher scores indicating greater risk; they are not fitted mortality probabilities. SAPS-I is missing in `r benchmark_missing[1]` stays and SOFA in `r benchmark_missing[2]`. For each outer held-out fold, missing benchmark scores are filled using the median score in the corresponding training fold. This retains all 4,000 stays for the main comparison and avoids an advantage from comparing different patient subsets, but a constant median may weaken benchmark discrimination when scores are missing. The same folds are used for the complete-benchmark sensitivity analysis below.
+
+```{r}
+#| label: roc-curves
+#| fig-width: 8
+#| fig-height: 6
+#| fig-cap: "Figure 3. ROC curves from all out-of-fold predictions and raw benchmark scores."
+roc_plot
+```
+
+Figure 3 shows ranking performance across decision thresholds. Its pooled curves summarize the held-out predictions, whereas Table 7 reports unweighted means of five fold-specific AUROCs; these summaries need not agree exactly.
+
+```{r}
+#| label: paired-gains
+best_mean <- colMeans(fold_auc)[best]
+gain <- data.frame(Benchmark=c('SAPS_I','SOFA'),Mean_paired_gain=sapply(c('SAPS_I','SOFA'),function(b) mean(fold_auc[,best]-fold_auc[,b])),SD_paired_gain=sapply(c('SAPS_I','SOFA'),function(b) sd(fold_auc[,best]-fold_auc[,b])))
+knitr::kable(gain,digits=3,caption=paste('Table 8. Paired fold AUROC gains of',best,'over each benchmark.'))
+```
+
+The highest mean AUROC belongs to **`r best` (`r fmt(best_mean)`)**. Table 8 compares the gain with its fold-to-fold variation. Against SAPS-I, the mean gain is `r fmt(gain$Mean_paired_gain[1])` and its SD is `r fmt(gain$SD_paired_gain[1])`; against SOFA, they are `r fmt(gain$Mean_paired_gain[2])` and `r fmt(gain$SD_paired_gain[2])`. `r if(all(gain$Mean_paired_gain > gain$SD_paired_gain)) 'Both mean gains exceed one SD of the paired fold differences, suggesting a consistent improvement at this descriptive scale.' else 'At least one mean gain does not exceed one SD of the paired fold differences, so its improvement is not clearly separated from fold variation at this descriptive scale.'` This is not a significance test: overlapping training sets make fold estimates dependent, and five folds offer limited uncertainty information.
+
+The prespecified selection rule chooses the model with the highest mean outer-fold AUROC, preferring ridge if it is within 0.01 AUROC of the best because of its simpler additive form and interpretable coefficients. This selects **`r final_name`**, with mean AUROC **`r fmt(mean(fold_auc[,final_name]))`**. Its preprocessing and fitted model are refit on all set-a; ridge and forest tuning for that refit uses a new three-fold split of set-a. The final full-data ridge penalty is `r final_tuning$lambda`. Out-of-fold log losses are ridge `r fmt(cv_loss['Ridge'])`, GAM `r fmt(cv_loss['GAM'])`, and forest `r fmt(cv_loss['Forest'])`; these secondary scores were not used to change the family-selection rule.
+
+The final pipeline is `output/cp2_final_model.rds`, and all five out-of-fold scores are in `output/cp2_oof_predictions.csv`. The serialized pipeline includes fitted medians, centers, scales, kept columns, category definitions, the model, and a prediction function. A round-trip check confirms that reloaded predictions match the in-memory fit. The shared raw feature builder must be reused in Checkpoint 3. No set-b or set-c records or outcomes were downloaded or read.
+
+```{r}
+#| label: complete-case-sensitivity
+knitr::kable(complete_case_comparison,digits=3,row.names=FALSE,caption='Table 9. Sensitivity analysis on stays with both benchmark scores observed, preserving original folds and model predictions.')
+```
+
+Table 9 compares all methods on the same `r sum(benchmark_complete)` stays with both scores recorded, without refitting any model. The highest mean AUROC in this subset belongs to `r complete_case_comparison$Model[which.max(complete_case_comparison$Mean)]`, and both benchmark means are `r if(all(complete_case_comparison$Mean[1:3]>max(complete_case_comparison$Mean[4:5]))) 'below all three fitted models, supporting the main discrimination comparison on a common observed-score subset.' else 'not uniformly below the fitted models, so the main comparison is sensitive to this subset.'` Differences from Table 7 can reflect both median score filling and a different patient subset; this analysis cannot separate those explanations.
+
+## Limitations and student review
+
+A 48-hour summary loses temporal detail, can contain treatment responses, and is not appropriate for predicting at ICU admission. Monitoring intensity, imputation, and missingness can vary across hospitals. The wide feature set is redundant, the GAM feature selection is clinically motivated but subjective, and tuning grids are small. CV does not establish calibration, clinical usefulness, or transportability. Those require the distinct Checkpoint 3 evaluation. Model-family selection may make the reported winner's CV performance optimistic even though hyperparameters were tuned within training sets.
+
+Before submitting, review the cleaning bounds, explain why preprocessing must be refit inside inner and outer training folds, inspect the fitted partial effects, and decide whether the final-model choice and written clinical judgments are ones you can defend. The course requires your own ideas and judgment in written interpretation.
+
+## Appendix A: exact predictor names and exclusions
+
+```{r}
+#| label: exact-predictors
+knitr::kable(data.frame(Predictor=raw_predictors),caption='Table A1. Complete original predictor list.')
+knitr::kable(data.frame(Dropped_constant_encoded_column=names(full_pp$keep)[!full_pp$keep]),caption='Table A2. Constant columns removed in the complete set-a refit.')
+```
+
+Table A1 makes the predictor inventory explicit; the groups are explained in Table 2. Table A2 records the full-data constant-column exclusions. The resampling audit file retains each outer training split's preprocessing, so fold-specific exclusions can also be inspected.
+
+## Appendix B: carried-forward plausibility bounds
+
+```{r}
+knitr::kable(plausibility,caption='Table B1. Original Checkpoint 1 bounds, applied before modeling; boundaries are included.')
+```
+
+Table B1 defines the same fixed cleaning screens used previously. These are plausibility limits rather than normal reference ranges and were not estimated from outcomes or resampling folds.
+
+## Reproducibility and references
+
+Run `pixi run --locked checkpoint2` from this directory. Input datasets are read only from `data/`, and analysis artifacts are written only under `output/`. Saved-model reload checks run separately in `scripts/verify_outputs.R`; no earlier output is required to run the report. Figures and tables are regenerated from raw data on each run; no result cache is used.
+
+Data: Silva I, Moody G, Scott DJ, Celi LA, Mark RG (2012). Predicting in-hospital mortality of ICU patients: The PhysioNet/Computing in Cardiology Challenge 2012. *Computing in Cardiology* 39:245–248. [Dataset and documentation](https://physionet.org/content/challenge-2012/1.0.0/). The public dataset is licensed under Open Data Commons Attribution License v1.0.
+
+Requirements: [BIOSTAT 707 Checkpoints 2 and 3 checklist](https://steverozen.github.io/biostat707_2026/checkpoint2-3-checklist.html), checked 2026-10-18.
+
+```{r}
+analysis_elapsed_minutes <- as.numeric(difftime(Sys.time(),analysis_started,units='mins'))
+writeLines(sprintf('Analysis and report chunks: %.2f minutes',analysis_elapsed_minutes),'output/cp2_runtime.txt')
+knitr::kable(data.frame(Measure='Elapsed analysis minutes (before final hypertext markup language (HTML) assembly)',Value=round(analysis_elapsed_minutes,2)),caption='Table C1. Measured runtime on this computer.')
+```
+
+Table C1 records the elapsed computation rather than an assumed runtime; first-time environment installation and downloading data are additional setup costs.
+
+```{r}
+#| label: session-info
+#| echo: false
+sessionInfo()
+```

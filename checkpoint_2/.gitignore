@@ -1,0 +1,14 @@
+data/
+.pixi/
+.Rhistory
+checkpoint2_files/
+output/*
+!output/checkpoint2.html
+!output/cp2_*.csv
+!output/cp2_*.rds
+!output/cp2_*.png
+!output/cp2_runtime.txt
+.quarto/
+
+/.quarto/
+**/*.quarto_ipynb

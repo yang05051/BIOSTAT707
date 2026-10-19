@@ -1,0 +1,30 @@
+[workspace]
+name = "biostat707-checkpoint2"
+channels = ["conda-forge"]
+platforms = ["linux-64", "osx-arm64", "osx-64", "win-64"]
+
+[dependencies]
+quarto = ">=1.7"
+r-base = "4.5.*"
+r-knitr = "*"
+r-rmarkdown = "*"
+"r-data.table" = "*"
+r-dplyr = "*"
+r-tidyr = "*"
+r-ggplot2 = "*"
+r-gtsummary = "*"
+r-naniar = "*"
+r-visdat = "*"
+r-upsetr = "*"
+r-sessioninfo = "*"
+r-here = "*"
+r-readr = "*"
+python = "3.12.*"
+pandas = "*"
+r-glmnet = ">=5.0,<6"
+r-ranger = ">=0.18.0,<0.19"
+r-mgcv = ">=1.9_4,<2"
+r-tidyverse = ">=2.0.0,<3"
+
+[tasks]
+checkpoint2 = "quarto render checkpoint2.qmd --output-dir output"
